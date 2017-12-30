@@ -1,0 +1,314 @@
+---
+title: "GC Churn Model"
+author: "Luke Singham"
+date: "18/07/2017"
+output: html_document
+---
+
+## Aim
+
+>1. Please create a model that predicts which businesses are likely to churn at the start of 2015 based on the  vertical  and  incorporation_date.
+2. We have an inkling that a dropoff in the number of mandates added might be an advance indicator of someone churning. Please can you assess whether this might be true, and if you think it is useful, incorporate it into your model from part (1).
+
+## The Data
+```{r}
+# Load packages
+suppressPackageStartupMessages({
+    library(data.table)   # Fast I/O
+    library(dplyr)        # Data munging
+    library(tidyr)        # Data munging
+    library(lubridate)    # Makes dates easy
+    library(plotly)       # Interactive charts
+    library(magrittr)     # pipe operators
+    library(caret)        # Handy ML functions
+    library(rpart)        # Decision Trees
+    library(rpart.plot)   # Pretty tree plots
+    library(ROCR)         # ML evaluation
+    library(e1071)        # Misc stat fns
+    library(randomForest) # rf
+})
+
+set.seed(42)
+
+# Read data and drop row number column
+df <- fread("monthly_data_(2)_(2).csv", drop = 1)
+
+# Have a glimpse of the data
+glimpse(df)
+```
+
+## Data Munging
+Some data munging needs to occur for our binary classifiers to make use of the data within. This includes handling dates.
+
+```{r}
+# Reshape data and create new columns
+df %<>%
+    gather(key = date, value = quantity, starts_with("20")) %>%
+    separate(date, c("date","paymentMandate"), "_") %>%
+    spread(paymentMandate, quantity) %>%
+    mutate(incorporation_date = as.Date(incorporation_date),
+           date = as.Date(date),
+           incorporation_time = round(as.numeric(difftime(as.Date("2014-12-01"), 
+                                                    as.Date(incorporation_date), 
+                                                    unit="weeks")) / 52.25,
+                                digits = 1)) %>%
+    arrange(date)
+
+# What does the new data look like?
+glimpse(df)
+```
+
+### What is Churn
+For the purposes of this project I have defined 'churn' as zero mandates and payments for the first instance of that after the last mandate/payment made.
+
+```{r}
+# Create binary 'churn' column
+df$churn <- 0
+
+# For use in for loop - upper bound of data
+max.date <- max(df$date)
+
+# Mark all companies as churned in the month immediately their last activity
+for (company in unique(df$company_id)) {
+
+    # Subset data to company
+    df.sub <- subset(df, df$company_id == company)
+    
+    # Index of last positive mandate OR payment
+    last.pos.idx <- tail(which(df.sub$mandates != 0 | df.sub$payments != 0), 1)
+    
+    # Get date of last activity
+    last.activity.date <- df.sub$date[last.pos.idx]
+    
+    # If less than max.date of dataset mark churn ELSE do nothing i.e. positive at end of period
+    if (last.activity.date < max.date) {
+        
+        # Get churn date (last positive month plus 1mth)
+        churn.date <- last.activity.date %m+% months(1)
+        
+        # Mark month of churn as 1
+        df[df$date == churn.date & df$company_id == company, ]$churn <- 1
+    }
+}
+
+# Multiple rows per company, filter for last month or churn month values...
+# Get churners
+df %>% filter(churn == 1) -> churners
+
+# Get max date row of remainers (non-churners)
+df %>% 
+    filter(churn == 0 & !(company_id %in% churners$company_id) & date == max(date)) -> remainers
+
+# Combine and variables coded ready for modelling
+churners %>% 
+    rbind(remainers) %>%
+    mutate(vertical = as.factor(vertical),
+           churn    = as.factor(churn)) -> model.df
+```
+
+### Churns over the year
+```{r}
+# Plot churners
+model.df %>%
+    filter(churn == 1) %>%
+    group_by(date) %>%
+    summarise(n = n()) %>%
+    plot_ly( x = ~date, y = ~n, type = 'scatter', mode = 'lines')
+```
+Could do more on exploratory but this is the easiest to cut back for this report. 
+
+### Balance of the data
+The proportion of churn is `r round(length(which(model.df$churn == 1)) / length(model.df$churn) * 100, 2)`%. Representing an imbalanced dataset. Accuracy is an inappropriate measure (I could get `r round(length(which(model.df$churn == 0)) / length(model.df$churn) * 100, 2)`% accuracy predicting no businesses leave GC), so I will focus on recall and accuracy.
+
+```{r}
+# Loyal vs Churn
+table(model.df$churn)
+```
+
+## Model
+Survival models and binary classifiers are common approaches to 'Churn' models. I will approach the GC model using the latter, though if I had more time I would investigate other classifiers and a survival model. I will limit the range of models to a logistic, a decision tree and an ensemble.
+
+### Split Data
+```{r}
+# 80/20 train test split
+index    <- createDataPartition(model.df$churn, p = 0.8, list = FALSE)
+train.df <- model.df[index, ]
+test.df  <- model.df[-index, ]
+
+# Check balance of the training split
+table(train.df$churn)
+# Check balance of the test split
+table(test.df$churn)
+```
+
+### Logistic
+```{r}
+# Run model
+Logistic.model <- glm(churn ~ incorporation_time + vertical, 
+                      data   = train.df, 
+                      family = binomial(link = 'logit'))
+
+# Predict
+log.pred <- predict(Logistic.model, newdata = test.df, type = 'response')
+
+# Convert probs to binary
+log.pred <- as.factor(ifelse(log.pred > 0.5, 1, 0))
+
+# Evaluation Metrics
+log.result    <- confusionMatrix(data = log.pred, test.df$churn)
+log.precision <- log.result$byClass['Pos Pred Value']    
+log.recall    <- log.result$byClass['Sensitivity']
+log.F1        <- log.result$byClass['F1']
+```
+
+### Decision Tree
+```{r}
+# Train model
+tree.model <- rpart(churn ~ incorporation_time + vertical,
+                    data = train.df,
+                    method = "class",
+                    control = rpart.control(xval = 10))
+
+# Plot
+rpart.plot(tree.model)
+
+# Evaluation metrics
+tree.pred      <- predict(tree.model, newdata = test.df, type = "class")
+tree.result    <- confusionMatrix(data = tree.pred, test.df$churn)
+tree.precision <- tree.result$byClass['Pos Pred Value']    
+tree.recall    <- tree.result$byClass['Sensitivity']
+tree.F1        <- tree.result$byClass['F1']
+```
+
+### Random Forest (Ensemble)
+```{r}
+# Train model
+forest.model <- randomForest(churn ~ incorporation_time + vertical, 
+                       data = train.df, 
+                       ntree=200, 
+                       type="classification")
+
+# See error reduction with number of trees ( not much gained beyond ~25 trees)
+plot(forest.model)
+
+# Look at the variable Importance from the random forest
+varImpPlot(forest.model, sort = T, main="Variable Importance")
+
+
+# Evaluation metrics
+forest.pred      <- predict(forest.model, newdata = test.df, type = "class")
+forest.result    <- confusionMatrix(data = forest.pred, test.df$churn)
+forest.precision <- forest.result$byClass['Pos Pred Value']    
+forest.recall    <- forest.result$byClass['Sensitivity']
+forest.F1        <- forest.result$byClass['F1']
+```
+
+### Evaluation Metrics
+```{r}
+log.precision; tree.precision; forest.precision;
+log.recall; tree.recall; forest.recall;
+log.F1; tree.F1; forest.F1;
+```
+Surprisingly, the logistic regression model performs the best, with the top precision score and equal recall score with that of the decision tree. With more time, I'd see if tweaks to the decision tree and random forest models could change this. Its also possible over/undersampling could help. From here on I will use the logistic regression model.
+
+## Examine the incorporation of time information
+Per the second part of the GC spec, examine the inclusion of time information. This requires more data munging. Taking 
+code used from above, I will extend to include the derivation of a very basic time period variable.
+
+```{r}
+# Create binary 'leading_indicator' column
+model.df$leading_indicator <- 0
+
+# Min date for which a leading_indicator can be calculated (lower limit of data)
+min.date <- min(df$date)
+
+# If month before 'churn' (churn-1), is below the level of mandates of the month 2 months prior (churn-2) then
+# make leading_indicator == 1
+for (company in churners$company_id) {
+
+    # Subset data to company
+    df.sub <- subset(df, df$company_id == company)
+    
+    # Get month prior to churn
+    month.prior <- df.sub$date[df.sub$churn == 1] %m-% months(1)
+
+    # Get two months prior to churn
+    two.month.prior <- df.sub$date[df.sub$churn == 1] %m-% months(2)
+
+    # If two months prior is within dataset date range and level of mandates is greater than 0
+    if ((two.month.prior > min.date) && (df.sub$mandates[df.sub$date == two.month.prior] > 0)) {
+        
+        # Compare number of mandates 1 month prior to 2 months prior, if less, mark 'leading_indicator' as '1' 
+        if (df.sub$mandates[df.sub$date == month.prior] < df.sub$mandates[df.sub$date == two.month.prior]) {
+            model.df[model.df$company_id == company, ]$leading_indicator <- 1
+        }
+    }
+}
+```
+### Of the churners, how many have a leading indicator?
+```{r}
+model.df %>% 
+    filter(churn == 1) %>%
+    group_by(leading_indicator) %>%
+    summarise(n=n()) %>%
+    mutate(percent = round(n / sum(n) * 100, 1))
+
+```
+
+### Re-train model and evaluate
+```{r}
+# Re-split data so 'leading_indicator' is in columns (the index remains the same)
+train.df <- model.df[index, ]
+test.df  <- model.df[-index, ]
+```
+
+### Logistic
+```{r}
+# Run model
+lead.logistic.model <- glm(churn ~ incorporation_time + vertical + leading_indicator, 
+                      data   = train.df, 
+                      family = binomial(link = 'logit'))
+
+# Predict
+log.pred <- predict(lead.logistic.model, newdata = test.df, type = 'response')
+
+# Convert probs to binary
+log.pred <- as.factor(ifelse(log.pred > 0.5, 1, 0))
+
+# Evaluation Metrics
+lead.log.result    <- confusionMatrix(data = log.pred, test.df$churn)
+lead.log.precision <- log.result$byClass['Pos Pred Value']
+lead.log.recall    <- log.result$byClass['Sensitivity']
+lead.log.F1        <- log.result$byClass['F1']
+```
+
+### Evaluation Metrics
+Compare the precision and recall of the logistic model with and without the `lead_indicator`.
+```{r}
+log.precision
+lead.log.precision
+log.recall
+lead.log.recall
+
+# Have a look at the model coefficients and p-values
+summary(lead.logistic.model)
+```
+Generally, it is best to minimise the `AIC`. The `Logistic.model` model AIC is `r round(Logistic.model$aic, 2)` compared with the `lead.logistic.model` incorporating the `lead_indicator` is `r round(lead.logistic.model$aic, 2)`. The `lead_indicator` has not changed the predictive power on this dataset, but since the `AIC` favours a better model fit whilst penalising for additional predictors, the model to choose is the `lead.logistic.model`.
+
+#### Re-train model and save
+```{r}
+# Re-train on all data
+final.model <- glm(churn ~ incorporation_time + vertical + leading_indicator, 
+                      data   = model.df, 
+                      family = binomial(link = 'logit'))
+
+save(final.model, file = "model.rda")
+```
+## Recommendations for further investigation/Comments
+- The `lead_indicator` was a quick and dirty test, I'd spend more time looking at a better construction (e.g. moving avg)
+- If the cost of rentention activities vs losing a customer was known then an the optimal trade-off in terms of business cost could be found.
+- Incorporating additional data, e.g. CRM data showing interactions. Potentially assessing sales/account staff.
+- If it were a production model prompting staff to do retention calls, evaluate the impact of such calls through
+modelling e.g. a/b testing
+- Test model performance with a change to balancing the classes e.g. under/oversampling, boostrap samples. This may explain the relative underperformance of tree based models in this exercise.
+- Try other binary classifier models.
